@@ -15,30 +15,35 @@ class DataPreprocessing:
             ('intensity', np.float32, 1),
             ('ring', np.uint16, 1),
             ('time', np.float32, 1),
-        ])
-        
+        ])       
+                
         self.T_lidar_camRect1 = np.array([
-            [ 0.01539728189227399,  -0.0012823052573279758,  0.9998806325774878,     0.448 ],
-            [-0.9996610000153124,    0.020978176075891836,   0.015420803380972237,    0.255 ],
-            [-0.02099544614233234, -0.9997791115150167,    -0.0009588636652390625, -0.215 ],
-            [0.0, 0.0, 0.0, 1.0]
+            [ 0.01539728189227399,  -0.0012823052573279758,   0.9998806325774878,   0.448 ],
+            [-0.9996610000153124,    0.020978176075891836,    0.015420803380972237, 0.255 ],
+            [-0.02099544614233234,  -0.9997791115150167,     -0.0009588636652390625, -0.215 ],
+            [ 0.0,                   0.0,                     0.0,                   1.0 ]
         ])
+  
+        #   camRect1:
+        #     camera_type: frame
+        #     camera_location: left
+        #     is_rectified: true
+        #     camera_model: pinhole
+        #     camera_matrix:
+        #     - 1164.6238115833075
+        #     - 1164.6238115833075
+        #     - 713.5791168212891
+        #     - 570.9349365234375
+        
+        
         self.T_cam_lidar = np.linalg.inv(self.T_lidar_camRect1)
+        
         self.K = np.array([[1164.6238115833075, 0.0, 713.5791168212891],
                            [0.0, 1164.6238115833075, 570.9349365234375],
                            [0.0, 0.0, 1.0]])
         
-        self.tracks = np.load("E:/GSN/train/interlaken_00_c/object_detections/left/tracks.npy")
-        #print(self.tracks.dtype)
-        #print(self.tracks.shape)
-        # self.label_t = self.tracks['t']
-        # self.label_x = self.tracks['x']
-        # self.label_y = self.tracks['y']
-        # self.label_w = self.tracks['w']
-        # self.label_h = self.tracks['h']
-        # self.label_class_id = self.tracks['class_id']
-        # self.label_track_id = self.tracks['track_id']
         
+        self.tracks = np.load("E:/GSN/train/interlaken_00_c/object_detections/left/tracks.npy")
         self.exposures = self.load_image_timestamps("interlaken_00_c_image_exposure_timestamps_left.txt") 
         
     def load_image_timestamps(self, file_name):
@@ -77,30 +82,53 @@ class DataPreprocessing:
                     filename = out_dir / f"frame_{self.frame_id:06d}.npy"
                     #np.save(filename, pts)
                     
-                    print(pts.shape)
-                    w = 1440
-                    h = 1080
-                    #img = np.zeros((h,w,3))
-                    img = cv2.imread(f"E:/GSN/imgs/{self.frame_id:06d}.png")
+                    # W = 640 #1440
+                    # H = 480 #1080
+                    #img = np.zeros((H,W,3))
+                    #img = cv2.imread(f"E:/GSN/imgs/{self.frame_id:06d}.png")
+                    
+                    img = cv2.imread(f"E:/GSN/imgs_/train/interlaken_00_c/images/left/distorted/{self.frame_id:06d}.png")
+                    H, W = img.shape[:2]
                     
                     xyz = pts[:, :3]
+                    pcd = op3.geometry.PointCloud()
+                    pcd.points = op3.utility.Vector3dVector(xyz)
+                    op3.visualization.draw_geometries([pcd])
+
+                    plt.figure(figsize=(8,8))
+                    plt.scatter(pts[:, 0], pts[:, 1], s=0.2)
+                    plt.xlabel("X")
+                    plt.ylabel("Y")
+                    plt.title("widok z gory")
+                    plt.axis("equal")
+                    
                     ones = np.ones((xyz.shape[0], 1))
                     pts_h = np.hstack([xyz, ones])
-
-                    pts_cam = (self.T_lidar_camRect1 @ pts_h.T).T
-                    #pts_cam = (self.T_cam_lidar @ pts_h.T).T
-                    
+                    pts_cam = (self.T_cam_lidar @ pts_h.T).T
                     
                     X, Y, Z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
                     mask = Z > 0
                     X, Y, Z = X[mask], Y[mask], Z[mask]
-
+                    
+                    plt.figure(figsize=(8,8))
+                    plt.scatter(X, Z, s=0.2)
+                    plt.xlabel("X")
+                    plt.ylabel("Z")
+                    plt.title("cam view")
+                    plt.axis("equal")
+                    
+                    plt.figure(figsize=(8,8))
+                    plt.scatter(X, Y, s=0.2)
+                    plt.xlabel("X")
+                    plt.ylabel("Y")
+                    plt.title("cam view 2")
+                    plt.axis("equal")
                     
                     
-                    u = (self.K[0, 0] * X / Z) + self.K[0, 2]
-                    v = (self.K[1, 1] * Y / Z) + self.K[1, 2]
+                    u = self.K[0,0] * X / Z + self.K[0,2]
+                    v = self.K[1,1] * Y / Z + self.K[1,2]
                     
-                    mask_img = (u >= 0) & (u < w) & (v >=0) & (v < h)
+                    mask_img = (u >= 0) & (u < W) & (v >=0) & (v < H)
                     u = u[mask_img].astype(int)
                     v = v[mask_img].astype(int)
                     for px, py in zip(u, v):
@@ -126,6 +154,7 @@ class DataPreprocessing:
                     
                     cv2.imshow("results", img)
                     cv2.waitKey(0)
+                    plt.show()
                     
                     self.frame_id += 1
                     

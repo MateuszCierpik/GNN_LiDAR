@@ -96,7 +96,7 @@ class DataPreprocessing:
         
     def map_points(self, points_dir, visualize=False):
         history_points = []
-        num_back = 3
+        num_back = 1
         for frame_id, name in enumerate(os.listdir(points_dir)):   
             pts = np.load(os.path.join(points_dir, name))
 
@@ -215,7 +215,6 @@ class DataPreprocessing:
                 edge_attr=torch.tensor(edge_attr, dtype=torch.float32),
                 bboxes=torch.tensor(bboxes, dtype=torch.int16),
                 labels=torch.tensor(labels, dtype=torch.int16),
-                img_size=torch.tensor(img.shape[:2])
             )
             
             torch.save(data, f"graphs/frame_{frame_id:06d}.pt")
@@ -325,5 +324,5 @@ dp = DataPreprocessing()
 #dp.prepare_seq(seq_path_1, out_dir)    
 #dp.visualization(seq_path_1)
 
-dp.map_points(Path(r"E:/GSN/frames/interlaken_00"), visualize=True)
+dp.map_points(Path(r"E:/GSN/frames/interlaken_00"), visualize=False)
 

@@ -9,7 +9,11 @@ from torch_geometric.nn import PointNetConv
 import torch.nn.functional as F
 from yolox.models.yolo_head import YOLOXHead
 from pytorch_lightning import Trainer
-
+from yolox.utils import postprocess
+import torchmetrics
+import wandb
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 class LidarGraphDataset(Dataset):
     def __init__(self, root):
@@ -133,6 +137,7 @@ class LidarYOLOXModule(pl.LightningModule):
         self.save_hyperparameters()
         self.K = K
         self.model = LidarYOLOX(in_channels, num_classes, K)
+        self.map_metric = torchmetrics.detection.MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
 
     def step(self, batch):
         device = batch["x"].device
@@ -153,31 +158,97 @@ class LidarYOLOXModule(pl.LightningModule):
         loss_dict = self.step(batch)
         loss, iou_loss, conf_loss, cls_loss, l1_loss, num_fg = loss_dict
         
-        self.log_dict({
-            "loss": loss,
-            "iou_loss": iou_loss,
-            "conf_loss": conf_loss,
-            "cls_loss": cls_loss,
-            "num_fg": num_fg,
-        }, prog_bar=True)
+        self.log_dict(
+            {
+                "train/loss": loss,
+                "train/iou_loss": iou_loss,
+                "train/conf_loss": conf_loss,
+                "train/cls_loss": cls_loss,
+            },
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True
+        )
         
         return loss
+    
+    def validation_step(self, batch, batch_idx):
+        device = batch["x"].device
+        outputs = self.model(
+            batch["x"],
+            batch["pos"],
+            batch["edge_index"],
+            batch["batch"],
+            targets=None
+        )
+        
+        preds = postprocess(
+            outputs,
+            num_classes=self.hparams.num_classes,
+            conf_thre=0.5,
+            nms_thre=0.5
+        )
+
+        pred_list = []
+        target_list = []
+
+        for i, pred in enumerate(preds):
+            #print(batch["bboxes"][0][:5])
+            #print(pred[:, :4][:5])
+        
+            if pred is None:
+                pred_list.append({
+                    "boxes": torch.zeros((0,4), device=device),
+                    "scores": torch.zeros((0), device=device),
+                    "labels": torch.zeros((0), dtype=torch.long, device=device),
+                })
+            else:
+                pred_list.append({
+                    "boxes": pred[:, :4],
+                    "scores": pred[:, 4],
+                    "labels": pred[:, 6].long(),
+                })
+
+            target_list.append({
+                "boxes": batch["bboxes"][i].to(device),
+                "labels": batch["labels"][i].to(device),
+            })
+
+        self.map_metric.update(pred_list, target_list)
+    
+    def on_validation_epoch_end(self):
+        metrics = self.map_metric.compute()
+        self.log("val/mAP", metrics["map"], prog_bar=True)
+        self.log("val/mAP50", metrics["map_50"])
+        self.log("val/mAP75", metrics["map_75"])
+        self.map_metric.reset()
     
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=1e-4, weight_decay=1e-4)
     
     
 def main():
+    wandb.login()
+    wandb_logger = WandbLogger(project="GNN_LiDAR",
+                            entity="deep-neural-network-course",
+                            group="gnn",
+                            name="Mateusz Cierpik",
+                            log_model=True)
+    
+    
     K = np.array([[1164.6238115833075, 0.0, 713.5791168212891],
                   [0.0, 1164.6238115833075, 570.9349365234375],
                   [0.0, 0.0, 1.0]])
     
     dataset = LidarGraphDataset("graphs/")
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=5, collate_fn=lidar_collate_fn)
+    val_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=5, collate_fn=lidar_collate_fn)
     
     model = LidarYOLOXModule(num_classes=8, in_channels=4, K=K)
-    trainer = Trainer(accelerator="gpu", devices=1, precision="16-mixed", max_epochs=10)
-    trainer.fit(model, loader)
+    trainer = Trainer(accelerator="gpu", devices=1, precision="16-mixed", max_epochs=10, logger=wandb_logger, log_every_n_steps=1)
+    trainer.fit(model, loader, val_loader)
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":

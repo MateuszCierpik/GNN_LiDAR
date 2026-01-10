@@ -57,29 +57,63 @@ def lidar_collate_fn(batch):
         "bboxes": [b["bboxes"] for b in batch],
         "labels": [b["labels"] for b in batch]
     }
-    
-    
-def points_to_image(x, pos, batch, K, H=60, W=80):
+ 
+ 
+def xywh_to_xyxy(b):
+    x, y, w, h = b.unbind(-1)
+    x1 = x
+    y1 = y
+    x2 = x + w
+    y2 = y + h
+    return torch.stack([x1, y1, x2, y2], dim=-1)
+
+
+def xywh_to_cxcywh(b):
+    x, y, w, h = b.unbind(-1)
+    cx = x + w / 2
+    cy = y + h / 2
+    return torch.stack([cx, cy, w, h], dim=-1)
+
+
+def points_to_image(x, pos, batch, K, W=640, H=480, stride=8):
     X, Y, Z = pos.T
-    u = (K[0,0] * X / Z + K[0,2]) / 640 * W
-    v = (K[1,1] * Y / Z + K[1,2]) / 480 * H
 
-    u, v = u.long(), v.long()
-    mask = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    u = (K[0,0] * X / Z + K[0,2])
+    v = (K[1,1] * Y / Z + K[1,2])
 
-    img = torch.zeros(batch.max()+1, x.size(1), H, W, device=x.device)
-    for i in mask.nonzero().squeeze():
-        img[batch[i], :, v[i], u[i]] += x[i]
+    u = (u / stride).long()
+    v = (v / stride).long()
 
-    return img
+    Wf = W // stride
+    Hf = H // stride
+
+    mask = (u >= 0) & (u < Wf) & (v >= 0) & (v < Hf)
+
+    B = int(batch.max()) + 1
+    C = x.size(1)
+
+    feat_map = torch.zeros(B, C, Hf, Wf, device=x.device)
+    count = torch.zeros(B, 1, Hf, Wf, device=x.device)
+
+    for i in mask.nonzero().squeeze(1):
+        feat_map[batch[i], :, v[i], u[i]] += x[i]
+        count[batch[i], :, v[i], u[i]] += 1
+
+    feat_map = feat_map / torch.clamp(count, min=1.0)
+    return feat_map
 
 
 def build_yolox_targets(batch, device):
-    targets = [
-        torch.cat([l[:, None].float(), b], dim=1)
-        if b.numel() else torch.zeros((0, 5), device=device)
-        for b, l in zip(batch["bboxes"], batch["labels"])
-    ]
+    targets = []
+    for b, l in zip(batch["bboxes"], batch["labels"]):
+        if b.numel() == 0:
+            targets.append(torch.zeros((0, 5), device=device))
+        else:
+            b = b.to(device)
+            l = l.to(device)
+            bb = xywh_to_cxcywh(b)
+            t = torch.cat([l[:, None].float(), bb], dim=1)
+            targets.append(t)
 
     max_n = max(t.size(0) for t in targets)
     out = torch.zeros(len(targets), max_n, 5, device=device)
@@ -122,11 +156,13 @@ class LidarYOLOX(nn.Module):
         super().__init__()
         self.K = K
         self.backbone = GraphBackbone(in_channels)
-        self.yolo_head = YOLOXHead(num_classes=num_classes, width=1.0, in_channels=[256])
+        self.yolo_head = YOLOXHead(num_classes=num_classes, width=1.0, in_channels=[256], strides=[8])
 
     def forward(self, x, pos, edge_index, batch, targets=None):
         point_feat = self.backbone(x, pos, edge_index)
         feat_maps = points_to_image(x=point_feat, pos=pos, batch=batch, K=self.K)
+        #print("feat map mean:", feat_maps.abs().mean())
+        #print("feat map nonzeros:", feat_maps.nonzero().size(0))
 
         return self.yolo_head([feat_maps], targets, imgs=None)
 
@@ -142,6 +178,7 @@ class LidarYOLOXModule(pl.LightningModule):
     def step(self, batch):
         device = batch["x"].device
         targets = build_yolox_targets(batch, device)
+        #print("targets[0][:5]:", targets[0][:5])
         
         loss_dict = self.model(
             batch["x"],
@@ -185,9 +222,12 @@ class LidarYOLOXModule(pl.LightningModule):
         preds = postprocess(
             outputs,
             num_classes=self.hparams.num_classes,
-            conf_thre=0.5,
-            nms_thre=0.5
+            conf_thre=0.05,
+            nms_thre=0.3
         )
+        
+        #print("GT:", xywh_to_xyxy(batch["bboxes"][0])[:3])
+        #print("PRED:", preds[0][:3, :4])
 
         pred_list = []
         target_list = []
@@ -208,11 +248,18 @@ class LidarYOLOXModule(pl.LightningModule):
                     "scores": pred[:, 4],
                     "labels": pred[:, 6].long(),
                 })
+                
+            gt_xyxy = xywh_to_xyxy(batch["bboxes"][i].to(device))
 
             target_list.append({
-                "boxes": batch["bboxes"][i].to(device),
+                "boxes": gt_xyxy,
                 "labels": batch["labels"][i].to(device),
             })
+
+            # target_list.append({
+            #     "boxes": batch["bboxes"][i].to(device),
+            #     "labels": batch["labels"][i].to(device),
+            # })
 
         self.map_metric.update(pred_list, target_list)
     
@@ -241,8 +288,8 @@ def main():
                   [0.0, 0.0, 1.0]])
     
     dataset = LidarGraphDataset("graphs/")
-    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=5, collate_fn=lidar_collate_fn)
-    val_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=5, collate_fn=lidar_collate_fn)
+    loader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=5, collate_fn=lidar_collate_fn)
+    val_loader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=5, collate_fn=lidar_collate_fn)
     
     model = LidarYOLOXModule(num_classes=8, in_channels=4, K=K)
     trainer = Trainer(accelerator="gpu", devices=1, precision="16-mixed", max_epochs=10, logger=wandb_logger, log_every_n_steps=1)

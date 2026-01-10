@@ -13,7 +13,6 @@ from yolox.utils import postprocess
 import torchmetrics
 import wandb
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import ModelCheckpoint
 
 class LidarGraphDataset(Dataset):
     def __init__(self, root):
@@ -93,13 +92,10 @@ def points_to_image(x, pos, batch, K, W=640, H=480, stride=8):
     C = x.size(1)
 
     feat_map = torch.zeros(B, C, Hf, Wf, device=x.device)
-    count = torch.zeros(B, 1, Hf, Wf, device=x.device)
 
     for i in mask.nonzero().squeeze(1):
         feat_map[batch[i], :, v[i], u[i]] += x[i]
-        count[batch[i], :, v[i], u[i]] += 1
 
-    feat_map = feat_map / torch.clamp(count, min=1.0)
     return feat_map
 
 
@@ -161,9 +157,6 @@ class LidarYOLOX(nn.Module):
     def forward(self, x, pos, edge_index, batch, targets=None):
         point_feat = self.backbone(x, pos, edge_index)
         feat_maps = points_to_image(x=point_feat, pos=pos, batch=batch, K=self.K)
-        #print("feat map mean:", feat_maps.abs().mean())
-        #print("feat map nonzeros:", feat_maps.nonzero().size(0))
-
         return self.yolo_head([feat_maps], targets, imgs=None)
 
     
@@ -256,10 +249,6 @@ class LidarYOLOXModule(pl.LightningModule):
                 "labels": batch["labels"][i].to(device),
             })
 
-            # target_list.append({
-            #     "boxes": batch["bboxes"][i].to(device),
-            #     "labels": batch["labels"][i].to(device),
-            # })
 
         self.map_metric.update(pred_list, target_list)
     

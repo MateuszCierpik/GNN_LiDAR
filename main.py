@@ -1,5 +1,5 @@
 from pathlib import Path
-import numpy as np
+import numpy as np, os, cv2
 import torch
 import pytorch_lightning as pl
 from torch.utils.data import Dataset
@@ -11,26 +11,193 @@ from yolox.models.yolo_head import YOLOXHead
 from pytorch_lightning import Trainer
 from yolox.utils import postprocess
 import torchmetrics
-import wandb
+import matplotlib.pyplot as plt
+# import wandb
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 
-class LidarGraphDataset(Dataset):
-    def __init__(self, root):
-        self.files = sorted(Path(root).glob("*.pt"))
+KITTI_DATASET_PATH = r"/home/tymek/Desktop/kitti_dataset"
+
+
+def visualize_lidar(points):
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Scatter plot
+    ax.scatter(
+        points[:, 0], points[:, 1], points[:, 2],
+        cmap='viridis', s=0.5
+    )
+
+    # Label axes
+    ax.set_xlabel('X (forward)')
+    ax.set_ylabel('Y (left)')
+    ax.set_zlabel('Z (up)')
+
+    # Optional: set equal aspect ratio
+    ax.set_box_aspect([np.ptp(points[:, 0]), np.ptp(points[:, 1]), np.ptp(points[:, 2])])
+
+    plt.show()
+
+def read_kitti_calib(file_path: str):
+    calib = {}
+
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            key, value = line.split(":", 1)
+            arr = np.array([float(x) for x in value.strip().split()])
+
+            if key[0] == "P":
+                calib[key] = arr.reshape((3, 4))
+            else:
+                matrix = np.zeros((4, 4), dtype=np.float32)
+                matrix[3, 3] = 1.0
+                
+                if arr.shape == (12,):
+                    matrix[:3, :] = arr.reshape((3, 4))
+                elif arr.shape == (9,):
+                    matrix[:3, :3] = arr.reshape((3, 3))
+                
+                calib[key] = matrix
+            
+    return calib
+
+def read_kitti_dataset(dataset_path: str, filename: str):
+    SUPPORTED_CLASSES = {"Car": 0, "Pedestrian": 1, "Cyclist": 2}
+
+    calib = read_kitti_calib(os.path.join(dataset_path, "calib", f"{filename}.txt"))
+    image = cv2.imread(os.path.join(dataset_path, "image_2", f"{filename}.png"))
+    height, width, _ = image.shape
+
+    lidar_data = np.fromfile(os.path.join(dataset_path, "velodyne", f"{filename}.bin"), dtype=np.float32)
+    lidar_data = lidar_data.reshape(-1, 4)
+    # visualize_lidar(lidar_data[:, :3])
+    lidar_data = lidar_data[lidar_data[:, 0] >= 0]
+    # visualize_lidar(lidar_data[:, :3])
+
+    multiplier = calib["P2"] @ calib["R0_rect"] @ calib["Tr_velo_to_cam"]
+    
+    projected_points = (multiplier @ np.vstack([lidar_data[:, :3].T, np.ones((1, lidar_data.shape[0]))])).T
+    projected_points[:, 0] /= projected_points[:, 2]
+    projected_points[:, 1] /= projected_points[:, 2]
+    projected_points = projected_points[:, :-1]
+
+    mask_points = (projected_points[:, 0] >= 0) & (projected_points[:, 0] < width) & (projected_points[:, 1] >= 0) & (projected_points[:, 1] < height)
+
+    visible_points_img = projected_points[mask_points]
+    visible_points_lidar = lidar_data[mask_points]
+
+    # print(visible_points_img.shape)
+    # print(visible_points_lidar.shape)
+    # visualize_lidar(visible_points_lidar)
+
+    pos = visible_points_lidar[:, :3]
+    intensity = visible_points_lidar[:, -1]
+
+    # for i in range(visible_points_img.shape[0]):
+    #     cv2.circle(image, (int(visible_points_img[i, 0]), int(visible_points_img[i, 1])), 1, (0,0,255), -1)
+    
+    # cv2.imshow("Lidar", image)
+    # cv2.waitKey(0)
+
+    labels_full = 1*[(np.zeros((4,), dtype=np.float32), (0, -10.0))]
+    with open(os.path.join(dataset_path, "label_2", f"{filename}.txt")) as f:
+        while True:
+            line = f.readline()
+            if line == "":
+                break
+            values = line.split()
+            class_id = values[0]
+            if class_id not in SUPPORTED_CLASSES.keys():
+                continue
+            bbox = np.array([float(val) for val in values[4:8]], dtype=np.float32)
+            score = np.float32(values[14])
+            label = (SUPPORTED_CLASSES[class_id], score)
+
+            labels_full.append((bbox, label))
+    
+    labels_full.sort(key=lambda val: val[1][1], reverse=True)
+    labels_full = labels_full[:1]
+    
+    bboxes = np.array([label[0] for label in labels_full])
+    labels = np.array([label[1][0] for label in labels_full])
+    
+    return intensity, pos, bboxes, labels
+
+def create_graph(pos: torch.Tensor, radius: float, k: int):
+    N = pos.size(0)
+    device = pos.device
+
+    # ---- pairwise squared distance matrix ----
+    pos2 = (pos ** 2).sum(dim=1, keepdim=True)
+    dist2 = pos2 + pos2.t() - 2.0 * pos @ pos.t()
+
+    # ---- radius mask (exclude self for now) ----
+    mask = (dist2 <= radius ** 2) & (dist2 > 0)
+
+    # ---- KNN filtering inside radius ----
+    if k is not None:
+        # set distances outside radius to +inf
+        dist2_masked = dist2.clone()
+        dist2_masked[~mask] = float("inf")
+
+        # take k nearest neighbors
+        knn_dist, knn_idx = torch.topk(
+            dist2_masked, k, largest=False, dim=1
+        )
+
+        knn_mask = torch.zeros_like(mask)
+        row_idx = torch.arange(N, device=device)
+        valid = torch.isfinite(knn_dist)
+        print("valid", valid.size())
+        print("knn_mask", knn_mask.size())
+
+        knn_mask[row_idx[valid], knn_idx[valid]] = True
+        mask = mask & knn_mask
+
+    # ---- self-loops ----
+    idx = torch.arange(N, device=device)
+    mask[idx, idx] = True
+
+    # ---- edge index ----
+    edge_index = mask.nonzero(as_tuple=False).t().contiguous()
+
+    return edge_index
+
+class KITTIGraphDataset(Dataset):
+    def __init__(self, dir, split_range):
+        self.dataset_dir = dir
+        filenames = sorted([os.path.splitext(filename)[0] for filename in os.listdir(os.path.join(self.dataset_dir, "image_2"))])
+        bounds = [int(round(split_range[0]*len(filenames))), int(round(split_range[1]*len(filenames)))]
+        self.filenames = [val for i, val in enumerate(filenames) if i >= bounds[0] and i < bounds[1]]
         
     def __len__(self):
-        return len(self.files)
+        return len(self.filenames)
 
     def __getitem__(self, idx):
-        data = torch.load(self.files[idx], weights_only=False)
+        intensity, pos, bboxes, labels = read_kitti_dataset(self.dataset_dir, self.filenames[idx])
+        print("read_kitti_dataset return shapes:")
+        print("intensity.shape", intensity.shape)
+        print("pos.shape", pos.shape)
+        print("bboxes.shape", bboxes.shape)
+        print("labels.shape", labels.shape)
+
+        x_torch = torch.tensor(intensity)
+        pos_torch = torch.from_numpy(pos).contiguous()
+        edge_index_torch = create_graph(pos_torch, radius=0.5, k=30)
+        bboxes_torch = torch.tensor(bboxes)
+        labels_torch = torch.tensor(labels)
 
         return {
-            "x": data.x.float(),
-            "pos": data.pos.float(),
-            "edge_index": data.edge_index.long(),
-            "bboxes": data.bboxes.float(),
-            "labels": data.labels.long()
+            "x": x_torch.to(torch.float32),
+            "pos": pos_torch.to(torch.float32),
+            "edge_index": edge_index_torch.to(torch.long),
+            "bboxes": bboxes_torch.to(torch.float32),
+            "labels": labels_torch.to(torch.float32)
         }
         
         
@@ -57,7 +224,31 @@ def lidar_collate_fn(batch):
         "bboxes": [b["bboxes"] for b in batch],
         "labels": [b["labels"] for b in batch]
     }
+
+class KITTIDataModule(pl.LightningDataModule):
+    def __init__(self, data_dir, batch_size):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+
+    def setup(self, stage=None):
+        split_train = 0.7
+        split_val = 0.15
+        split_test = 0.15
+        
+        self.train_dataset = KITTIGraphDataset(KITTI_DATASET_PATH, [0.0, split_train])
+        self.val_dataset = KITTIGraphDataset(KITTI_DATASET_PATH, [split_train, split_train + split_val])
+        self.test_dataset = KITTIGraphDataset(KITTI_DATASET_PATH, [split_train + split_val, 1.0])
     
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, self.batch_size, shuffle=True, num_workers=1, collate_fn=lidar_collate_fn)
+    
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, self.batch_size, shuffle=False, num_workers=1, collate_fn=lidar_collate_fn)
+    
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, self.batch_size, shuffle=False, num_workers=1, collate_fn=lidar_collate_fn)
+
     
 def points_to_image(x, pos, batch, K, H=60, W=80):
     X, Y, Z = pos.T
@@ -140,6 +331,13 @@ class LidarYOLOXModule(pl.LightningModule):
         self.map_metric = torchmetrics.detection.MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
 
     def step(self, batch):
+        print("Batch inside step function")
+        print("intensity.shape", batch["x"].size())
+        print("pos.shape", batch["pos"].size())
+        print("edge_index.shape", batch["edge_index"].size())
+        print("bboxes.shape", batch["bboxes"].size())
+        print("labels.shape", batch["labels"].size())
+
         device = batch["x"].device
         targets = build_yolox_targets(batch, device)
         
@@ -228,27 +426,32 @@ class LidarYOLOXModule(pl.LightningModule):
     
     
 def main():
-    wandb.login()
-    wandb_logger = WandbLogger(project="GNN_LiDAR",
-                            entity="deep-neural-network-course",
-                            group="gnn",
-                            name="Mateusz Cierpik",
-                            log_model=True)
+
+    # wandb.login()
+    # wandb_logger = WandbLogger(project="GNN_LiDAR",
+    #                         entity="deep-neural-network-course",
+    #                         group="gnn",
+    #                         name="Mateusz Cierpik",
+    #                         log_model=True)
     
     
     K = np.array([[1164.6238115833075, 0.0, 713.5791168212891],
                   [0.0, 1164.6238115833075, 570.9349365234375],
                   [0.0, 0.0, 1.0]])
     
-    dataset = LidarGraphDataset("graphs/")
-    loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=5, collate_fn=lidar_collate_fn)
-    val_loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=5, collate_fn=lidar_collate_fn)
+    dm = KITTIDataModule(KITTI_DATASET_PATH, 1)
+    dm.setup()
     
-    model = LidarYOLOXModule(num_classes=8, in_channels=4, K=K)
-    trainer = Trainer(accelerator="gpu", devices=1, precision="16-mixed", max_epochs=10, logger=wandb_logger, log_every_n_steps=1)
-    trainer.fit(model, loader, val_loader)
+    # model = LidarYOLOXModule(num_classes=3, in_channels=4, K=K)
+    # trainer = Trainer(accelerator="cpu", devices=1, precision="16-mixed", max_epochs=10, log_every_n_steps=1)
+    # trainer.fit(model, datamodule=dm)
     
-    wandb.finish()
+    # wandb.finish()
+    # dm = KITTIDataModule(KITTI_DATASET_PATH, 3)
+    # dm.setup()
+
+    train_dl = dm.train_dataloader()
+    batch = next(iter(train_dl))
 
 
 if __name__ == "__main__":

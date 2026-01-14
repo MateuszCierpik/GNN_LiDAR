@@ -151,7 +151,7 @@ def create_graph(pos: torch.Tensor, radius: float, k: int):
         )
 
         knn_mask = torch.zeros_like(mask)
-        row_idx = torch.arange(N, device=device)
+        row_idx = torch.arange(N, device=device).unsqueeze(1).expand_as(knn_idx)
         valid = torch.isfinite(knn_dist)
         print("valid", valid.size())
         print("knn_mask", knn_mask.size())
@@ -179,6 +179,7 @@ class KITTIGraphDataset(Dataset):
         return len(self.filenames)
 
     def __getitem__(self, idx):
+        print(self.filenames[idx])
         intensity, pos, bboxes, labels = read_kitti_dataset(self.dataset_dir, self.filenames[idx])
         print("read_kitti_dataset return shapes:")
         print("intensity.shape", intensity.shape)
@@ -186,18 +187,21 @@ class KITTIGraphDataset(Dataset):
         print("bboxes.shape", bboxes.shape)
         print("labels.shape", labels.shape)
 
-        x_torch = torch.tensor(intensity)
-        pos_torch = torch.from_numpy(pos).contiguous()
-        edge_index_torch = create_graph(pos_torch, radius=0.5, k=30)
-        bboxes_torch = torch.tensor(bboxes)
-        labels_torch = torch.tensor(labels)
+                                                                        # N - number of points, D - number of detections per frame
+        x_torch = torch.tensor(intensity).unsqueeze(1)                  # (N, 1)
+        pos_torch = torch.from_numpy(pos).contiguous()                  # (N, 3)
+        edge_index_torch = create_graph(pos_torch, radius=0.2, k=15)    # (2, ...)
+        bboxes_torch = torch.tensor(bboxes)                             # (D, 4)
+        labels_torch = torch.tensor(labels)                             # (D,)
+
+        print("edge_index.shape", edge_index_torch.size())
 
         return {
             "x": x_torch.to(torch.float32),
             "pos": pos_torch.to(torch.float32),
             "edge_index": edge_index_torch.to(torch.long),
             "bboxes": bboxes_torch.to(torch.float32),
-            "labels": labels_torch.to(torch.float32)
+            "labels": labels_torch.to(torch.long)
         }
         
         
@@ -241,13 +245,13 @@ class KITTIDataModule(pl.LightningDataModule):
         self.test_dataset = KITTIGraphDataset(KITTI_DATASET_PATH, [split_train + split_val, 1.0])
     
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, self.batch_size, shuffle=True, num_workers=1, collate_fn=lidar_collate_fn)
+        return DataLoader(self.train_dataset, self.batch_size, shuffle=True, num_workers=4, collate_fn=lidar_collate_fn)
     
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, self.batch_size, shuffle=False, num_workers=1, collate_fn=lidar_collate_fn)
+        return DataLoader(self.val_dataset, self.batch_size, shuffle=False, num_workers=4, collate_fn=lidar_collate_fn)
     
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, self.batch_size, shuffle=False, num_workers=1, collate_fn=lidar_collate_fn)
+        return DataLoader(self.test_dataset, self.batch_size, shuffle=False, num_workers=4, collate_fn=lidar_collate_fn)
 
     
 def points_to_image(x, pos, batch, K, H=60, W=80):
@@ -277,6 +281,8 @@ def build_yolox_targets(batch, device):
 
     for i, t in enumerate(targets):
         out[i, :t.size(0)] = t
+    
+    print("Yolo targets:", out)
 
     return out
 
@@ -335,8 +341,8 @@ class LidarYOLOXModule(pl.LightningModule):
         print("intensity.shape", batch["x"].size())
         print("pos.shape", batch["pos"].size())
         print("edge_index.shape", batch["edge_index"].size())
-        print("bboxes.shape", batch["bboxes"].size())
-        print("labels.shape", batch["labels"].size())
+        print("number of set of bboxes", len(batch["bboxes"]))
+        print("number of labels", len(batch["labels"]))
 
         device = batch["x"].device
         targets = build_yolox_targets(batch, device)
@@ -438,20 +444,50 @@ def main():
     K = np.array([[1164.6238115833075, 0.0, 713.5791168212891],
                   [0.0, 1164.6238115833075, 570.9349365234375],
                   [0.0, 0.0, 1.0]])
+
+    # ds = KITTIGraphDataset(KITTI_DATASET_PATH, [0.0, 0.05])
+    # val = ds[3]
+
+    # pos_np = val["pos"].numpy()
+    # edges_np = val["edge_index"].numpy()
+
+    # fig = plt.figure(figsize=(10, 8))
+
+    # # ---- View 1: top-down ----
+    # ax = fig.add_subplot(1, 1, 1, projection='3d')
+    # sc1 = ax.scatter(pos_np[:,0], pos_np[:,1], pos_np[:,2], s=5, alpha=0.8)
+    # ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+    # ax.view_init(elev=30, azim=35)
+    # ax.grid(False)
+
+    # # Draw edges
+    # for (src, dst) in edges_np.T:
+    #     if src < len(pos_np) and dst < len(pos_np):
+    #         x_line = [pos_np[src, 0], pos_np[dst, 0]]
+    #         y_line = [pos_np[src, 1], pos_np[dst, 1]]
+    #         z_line = [pos_np[src, 2], pos_np[dst, 2]]
+    #         ax.plot(x_line, y_line, z_line, color='gray', alpha=0.3, linewidth=0.5)
+
+    # plt.tight_layout()
+    # plt.show()
+
     
     dm = KITTIDataModule(KITTI_DATASET_PATH, 1)
     dm.setup()
+
+    # train_dl = dm.train_dataloader()
+    # batch = next(iter(train_dl))
+    # print("x.size", batch["x"].size())
+    # print("pos.size", batch["pos"].size())
+    # print("edge_index.size", batch["edge_index"].size())
     
-    # model = LidarYOLOXModule(num_classes=3, in_channels=4, K=K)
-    # trainer = Trainer(accelerator="cpu", devices=1, precision="16-mixed", max_epochs=10, log_every_n_steps=1)
-    # trainer.fit(model, datamodule=dm)
+    model = LidarYOLOXModule(num_classes=3, in_channels=1, K=K)
+    trainer = Trainer(accelerator="cpu", devices=1, precision="16-mixed", max_epochs=10, log_every_n_steps=1)
+    trainer.fit(model, datamodule=dm)
     
     # wandb.finish()
     # dm = KITTIDataModule(KITTI_DATASET_PATH, 3)
     # dm.setup()
-
-    train_dl = dm.train_dataloader()
-    batch = next(iter(train_dl))
 
 
 if __name__ == "__main__":

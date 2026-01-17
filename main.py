@@ -17,6 +17,9 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import ModelCheckpoint
 
 KITTI_DATASET_PATH = r"/home/tymek/Desktop/kitti_dataset"
+BATCH_SIZE = 1
+NUM_WORKERS = 0
+INTERNAL_IMG_SIZE = 240, 1216
 
 
 def visualize_lidar(points):
@@ -72,6 +75,7 @@ def read_kitti_dataset(dataset_path: str, filename: str):
     calib = read_kitti_calib(os.path.join(dataset_path, "calib", f"{filename}.txt"))
     image = cv2.imread(os.path.join(dataset_path, "image_2", f"{filename}.png"))
     height, width, _ = image.shape
+    img_shape = (height, width)
 
     lidar_data = np.fromfile(os.path.join(dataset_path, "velodyne", f"{filename}.bin"), dtype=np.float32)
     lidar_data = lidar_data.reshape(-1, 4)
@@ -99,12 +103,12 @@ def read_kitti_dataset(dataset_path: str, filename: str):
     intensity = visible_points_lidar[:, -1]
 
     # for i in range(visible_points_img.shape[0]):
-    #     cv2.circle(image, (int(visible_points_img[i, 0]), int(visible_points_img[i, 1])), 1, (0,0,255), -1)
+    #     cv2.circle(image, (int(visible_points_img[i, 0]), int(visible_points_img[i, 1])), 0, (0,0,255), -1)
     
     # cv2.imshow("Lidar", image)
     # cv2.waitKey(0)
 
-    labels_full = 1*[(np.zeros((4,), dtype=np.float32), (0, -10.0))]
+    labels_full = []
     with open(os.path.join(dataset_path, "label_2", f"{filename}.txt")) as f:
         while True:
             line = f.readline()
@@ -121,12 +125,11 @@ def read_kitti_dataset(dataset_path: str, filename: str):
             labels_full.append((bbox, label))
     
     labels_full.sort(key=lambda val: val[1][1], reverse=True)
-    labels_full = labels_full[:1]
     
     bboxes = np.array([label[0] for label in labels_full])
-    labels = np.array([label[1][0] for label in labels_full])
+    labels = np.array([label[1][0] for label in labels_full]).reshape(-1, 1)
     
-    return intensity, pos, bboxes, labels
+    return intensity, pos, bboxes, labels, calib, img_shape
 
 def create_graph(pos: torch.Tensor, radius: float, k: int):
     N = pos.size(0)
@@ -180,7 +183,7 @@ class KITTIGraphDataset(Dataset):
 
     def __getitem__(self, idx):
         print(self.filenames[idx])
-        intensity, pos, bboxes, labels = read_kitti_dataset(self.dataset_dir, self.filenames[idx])
+        intensity, pos, bboxes, labels, calib, img_shape = read_kitti_dataset(self.dataset_dir, self.filenames[idx])
         print("read_kitti_dataset return shapes:")
         print("intensity.shape", intensity.shape)
         print("pos.shape", pos.shape)
@@ -201,32 +204,50 @@ class KITTIGraphDataset(Dataset):
             "pos": pos_torch.to(torch.float32),
             "edge_index": edge_index_torch.to(torch.long),
             "bboxes": bboxes_torch.to(torch.float32),
-            "labels": labels_torch.to(torch.long)
+            "labels": labels_torch.to(torch.long),
+            "calib" : calib,
+            "img_shape": img_shape
         }
+
+def build_yolox_targets(batches):
+    print("Building yolo targets")
+
+    def create_targets_from_batch(id, batch):
+        return torch.hstack([torch.full((len(batch["labels"]), 1), id), batch["labels"], batch["bboxes"]])
+
+    return torch.vstack([create_targets_from_batch(id, batch) for id, batch in enumerate(batches)])
         
         
-def lidar_collate_fn(batch):
-    x = torch.cat([b["x"] for b in batch], dim=0)
-    pos = torch.cat([b["pos"] for b in batch], dim=0)
+def lidar_collate_fn(batches):
+    print("lidar_collate_fn")
+
+    x = torch.cat([batch["x"] for batch in batches], dim=0)
+    pos = torch.cat([batch["pos"] for batch in batches], dim=0)
 
     edge_index, offset = [], 0
-    for b in batch:
-        edge_index.append(b["edge_index"] + offset)
-        offset += b["x"].size(0)
+    for batch in batches:
+        edge_index.append(batch["edge_index"] + offset)
+        offset += batch["x"].size(0)
     edge_index = torch.cat(edge_index, dim=1)
 
     batch_vec = torch.cat([
-        torch.full((b["x"].size(0),), i, dtype=torch.long)
-        for i, b in enumerate(batch)
+        torch.full((batch["x"].size(0),), i, dtype=torch.long)
+        for i, batch in enumerate(batches)
     ])
+
+    targets = build_yolox_targets(batches)
+    print("YOLO targets.size:", targets.size())
 
     return {
         "x": x,
         "pos": pos,
         "edge_index": edge_index,
         "batch": batch_vec,
-        "bboxes": [b["bboxes"] for b in batch],
-        "labels": [b["labels"] for b in batch]
+        "bboxes": [batch["bboxes"] for batch in batches],
+        "labels": [batch["labels"] for batch in batches],
+        "targets": targets,
+        "calib": [batch["calib"] for batch in batches],
+        "img_shape": [batch["img_shape"] for batch in batches]
     }
 
 class KITTIDataModule(pl.LightningDataModule):
@@ -245,47 +266,42 @@ class KITTIDataModule(pl.LightningDataModule):
         self.test_dataset = KITTIGraphDataset(KITTI_DATASET_PATH, [split_train + split_val, 1.0])
     
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, self.batch_size, shuffle=True, num_workers=4, collate_fn=lidar_collate_fn)
+        return DataLoader(self.train_dataset, self.batch_size, shuffle=True, num_workers=NUM_WORKERS, collate_fn=lidar_collate_fn)
     
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, self.batch_size, shuffle=False, num_workers=4, collate_fn=lidar_collate_fn)
+        return DataLoader(self.val_dataset, self.batch_size, shuffle=False, num_workers=NUM_WORKERS, collate_fn=lidar_collate_fn)
     
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, self.batch_size, shuffle=False, num_workers=4, collate_fn=lidar_collate_fn)
+        return DataLoader(self.test_dataset, self.batch_size, shuffle=False, num_workers=NUM_WORKERS, collate_fn=lidar_collate_fn)
 
     
-def points_to_image(x, pos, batch, K, H=60, W=80):
-    X, Y, Z = pos.T
-    u = (K[0,0] * X / Z + K[0,2]) / 640 * W
-    v = (K[1,1] * Y / Z + K[1,2]) / 480 * H
+def points_to_image(x, pos, batch, calib, img_shape):
+    points_offset = (img_shape[0][1] - INTERNAL_IMG_SIZE[1], img_shape[0][0] - INTERNAL_IMG_SIZE[0])
 
-    u, v = u.long(), v.long()
-    mask = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-
-    img = torch.zeros(batch.max()+1, x.size(1), H, W, device=x.device)
-    for i in mask.nonzero().squeeze():
-        img[batch[i], :, v[i], u[i]] += x[i]
-
-    return img
-
-
-def build_yolox_targets(batch, device):
-    targets = [
-        torch.cat([l[:, None].float(), b], dim=1)
-        if b.numel() else torch.zeros((0, 5), device=device)
-        for b, l in zip(batch["bboxes"], batch["labels"])
-    ]
-
-    max_n = max(t.size(0) for t in targets)
-    out = torch.zeros(len(targets), max_n, 5, device=device)
-
-    for i, t in enumerate(targets):
-        out[i, :t.size(0)] = t
+    projected_points = (calib[0]["P2"] @ calib[0]["R0_rect"] @ calib[0]["Tr_velo_to_cam"] @ np.vstack([pos.detach().cpu().numpy().T, np.ones((1, pos.size(0)))])).T
     
-    print("Yolo targets:", out)
+    projected_points[:, 0] /= projected_points[:, 2]
+    projected_points[:, 1] /= projected_points[:, 2]
+    projected_points = projected_points[:, :-1]
+    projected_points = np.astype(projected_points, np.int16)
+    projected_points -= np.array(points_offset).reshape((1, -1))
 
-    return out
+    mask = (projected_points[:, 0] >= 0) & (projected_points[:, 1] >= 0)
+    projected_points = projected_points[mask]
+    x = x[mask]
 
+    img = np.zeros((batch.max()+1, x.size(1), INTERNAL_IMG_SIZE[1], INTERNAL_IMG_SIZE[0]))
+    img[0, :, projected_points[:,0], projected_points[:, 1]] += x[:].detach().cpu().float().numpy() # TODO Adjust when batch > 1
+
+    img_torch = torch.from_numpy(img).float().to(x.device)  # (B, C, W, H)
+
+    pooled = F.max_pool2d(
+        img_torch,
+        kernel_size=4,
+        stride=4
+    )
+
+    return pooled
 
 class MLP(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -319,11 +335,11 @@ class LidarYOLOX(nn.Module):
         super().__init__()
         self.K = K
         self.backbone = GraphBackbone(in_channels)
-        self.yolo_head = YOLOXHead(num_classes=num_classes, width=1.0, in_channels=[256])
+        self.yolo_head = YOLOXHead(num_classes=num_classes, width=1.0, in_channels=[256], strides=[4])
 
-    def forward(self, x, pos, edge_index, batch, targets=None):
+    def forward(self, x, pos, edge_index, batch, calib, img_shape, targets=None):
         point_feat = self.backbone(x, pos, edge_index)
-        feat_maps = points_to_image(x=point_feat, pos=pos, batch=batch, K=self.K)
+        feat_maps = points_to_image(x=point_feat, pos=pos, batch=batch, calib=calib, img_shape=img_shape)
 
         return self.yolo_head([feat_maps], targets, imgs=None)
 
@@ -345,14 +361,15 @@ class LidarYOLOXModule(pl.LightningModule):
         print("number of labels", len(batch["labels"]))
 
         device = batch["x"].device
-        targets = build_yolox_targets(batch, device)
         
         loss_dict = self.model(
             batch["x"],
             batch["pos"],
             batch["edge_index"],
             batch["batch"],
-            targets=targets
+            batch["calib"],
+            batch["img_shape"],
+            targets=batch["tragets"]
         )
 
         return loss_dict
@@ -383,6 +400,8 @@ class LidarYOLOXModule(pl.LightningModule):
             batch["pos"],
             batch["edge_index"],
             batch["batch"],
+            batch["calib"],
+            batch["img_shape"],
             targets=None
         )
         
@@ -439,47 +458,9 @@ def main():
     #                         group="gnn",
     #                         name="Mateusz Cierpik",
     #                         log_model=True)
-    
-    
-    K = np.array([[1164.6238115833075, 0.0, 713.5791168212891],
-                  [0.0, 1164.6238115833075, 570.9349365234375],
-                  [0.0, 0.0, 1.0]])
 
-    # ds = KITTIGraphDataset(KITTI_DATASET_PATH, [0.0, 0.05])
-    # val = ds[3]
-
-    # pos_np = val["pos"].numpy()
-    # edges_np = val["edge_index"].numpy()
-
-    # fig = plt.figure(figsize=(10, 8))
-
-    # # ---- View 1: top-down ----
-    # ax = fig.add_subplot(1, 1, 1, projection='3d')
-    # sc1 = ax.scatter(pos_np[:,0], pos_np[:,1], pos_np[:,2], s=5, alpha=0.8)
-    # ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
-    # ax.view_init(elev=30, azim=35)
-    # ax.grid(False)
-
-    # # Draw edges
-    # for (src, dst) in edges_np.T:
-    #     if src < len(pos_np) and dst < len(pos_np):
-    #         x_line = [pos_np[src, 0], pos_np[dst, 0]]
-    #         y_line = [pos_np[src, 1], pos_np[dst, 1]]
-    #         z_line = [pos_np[src, 2], pos_np[dst, 2]]
-    #         ax.plot(x_line, y_line, z_line, color='gray', alpha=0.3, linewidth=0.5)
-
-    # plt.tight_layout()
-    # plt.show()
-
-    
-    dm = KITTIDataModule(KITTI_DATASET_PATH, 1)
+    dm = KITTIDataModule(KITTI_DATASET_PATH, BATCH_SIZE)
     dm.setup()
-
-    # train_dl = dm.train_dataloader()
-    # batch = next(iter(train_dl))
-    # print("x.size", batch["x"].size())
-    # print("pos.size", batch["pos"].size())
-    # print("edge_index.size", batch["edge_index"].size())
     
     model = LidarYOLOXModule(num_classes=3, in_channels=1, K=K)
     trainer = Trainer(accelerator="cpu", devices=1, precision="16-mixed", max_epochs=10, log_every_n_steps=1)
